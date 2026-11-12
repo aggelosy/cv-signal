@@ -1,0 +1,118 @@
+name: Import CV Signal source once
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - cv-signal-github-source.zip
+      - .github/workflows/import-source.yml
+
+permissions: {}
+
+concurrency:
+  group: import-cv-signal-main
+  cancel-in-progress: false
+
+jobs:
+  import-source:
+    if: github.repository == 'aggelosy/cv-signal' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Verify and import the reviewed source archive
+        shell: python
+        run: |
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile
+          import hashlib
+          import stat
+          import subprocess
+
+          ARCHIVE = "cv-signal-github-source.zip"
+          WORKFLOW = ".github/workflows/import-source.yml"
+          EXPECTED_SHA256 = "E62716A293813974D8BC0F8641E275730CCE038F3ABECA075F15B28E6A69A1A9"
+          EXPECTED_FILES = 120
+
+          def extract_reviewed_source(archive, destination):
+              archive = Path(archive)
+              destination = Path(destination).resolve()
+              digest = hashlib.sha256(archive.read_bytes()).hexdigest().upper()
+              if digest != EXPECTED_SHA256:
+                  raise RuntimeError("Archive checksum does not match the reviewed source.")
+              validated = []
+              seen = set()
+              total_size = 0
+              with ZipFile(archive) as bundle:
+                  for entry in bundle.infolist():
+                      name = entry.filename
+                      relative = PurePosixPath(name)
+                      parts = relative.parts
+                      mode = entry.external_attr >> 16
+                      if (not name or "\\" in name or ":" in name or relative.is_absolute()
+                              or not parts or any(part in (".", "..") for part in parts)
+                              or any(part.lower() in (".git", ".github") for part in parts)
+                              or "/".join(parts) != name.rstrip("/")
+                              or name == ARCHIVE or stat.S_ISLNK(mode)
+                              or entry.flag_bits & 1):
+                          raise RuntimeError("Archive contains a disallowed member path or file type.")
+                      file_type = stat.S_IFMT(mode)
+                      if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                          raise RuntimeError("Archive contains a special file.")
+                      target = destination.joinpath(*parts)
+                      if not target.resolve().is_relative_to(destination):
+                          raise RuntimeError("Archive member escapes the extraction directory.")
+                      key = name.rstrip("/").casefold()
+                      if key in seen:
+                          raise RuntimeError("Archive contains duplicate member paths.")
+                      seen.add(key)
+                      if entry.is_dir():
+                          continue
+                      total_size += entry.file_size
+                      if entry.file_size > 5_000_000 or total_size > 10_000_000:
+                          raise RuntimeError("Archive exceeds the reviewed size limits.")
+                      content = bundle.read(entry)
+                      # The reviewed archive contains UTF-8 source text exported
+                      # on Windows. Match the reviewed Git commit's LF blobs.
+                      content.decode("utf-8")
+                      validated.append((relative.as_posix(), content.replace(b"\r\n", b"\n")))
+              if len(validated) != EXPECTED_FILES:
+                  raise RuntimeError("Archive has an unexpected source file count.")
+              # Validate every member before creating any source files. Refuse to
+              # overwrite existing files or follow an existing symbolic link.
+              for name, content in validated:
+                  target = destination.joinpath(*PurePosixPath(name).parts)
+                  if target.exists() or target.is_symlink():
+                      raise RuntimeError("Source import would overwrite an existing path.")
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  if not target.parent.resolve().is_relative_to(destination):
+                      raise RuntimeError("Source parent escapes the extraction directory.")
+                  with target.open("xb") as output:
+                      output.write(content)
+              return [name for name, _ in validated]
+
+          def main():
+              tracked = set(subprocess.check_output(["git", "ls-files", "-z"]).decode().strip("\0").split("\0"))
+              if tracked != {ARCHIVE, WORKFLOW}:
+                  raise RuntimeError("Expected only the two temporary import files; refusing to overwrite repository content.")
+              imported = extract_reviewed_source(ARCHIVE, Path.cwd())
+              subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
+              subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
+              subprocess.run(["git", "add", "--", *imported], check=True)
+              # Remove only the reviewed temporary ZIP. The owner removes this
+              # temporary workflow through GitHub's signed-in browser afterward.
+              subprocess.run(["git", "rm", "--", ARCHIVE], check=True)
+              subprocess.run(["git", "commit", "-m", "Import reviewed CV Signal application source"], check=True)
+              subprocess.run(["git", "push", "origin", "HEAD:refs/heads/main"], check=True)
+              print("Imported 120 reviewed source files and removed the temporary ZIP.")
+
+          if __name__ == "__main__":
+              main()
